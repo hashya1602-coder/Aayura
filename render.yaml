@@ -34,3 +34,31 @@ services:
       # Your live domain once known, e.g. https://aayura.com - Twilio calls back here
       - key: PUBLIC_URL
         sync: false
+
+  # Low-latency ConversationRelay voice agent (WebSocket). PUBLIC_URL is derived
+  # from RENDER_EXTERNAL_URL automatically, so it needs no manual URL.
+  - type: web
+    name: aayura-relay
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # gthread + many threads so long-lived WebSocket calls don't starve each other.
+    startCommand: gunicorn aasha_relay:app --worker-class gthread --threads 24 --timeout 300 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PATIENT_NAME
+        value: Radha
+      - key: RELAY_VOICE
+        value: en-IN-Neural2-A
+      # --- secrets: set these in the Render dashboard, not here ---
+      - key: TWILIO_SID
+        sync: false
+      - key: TWILIO_TOKEN
+        sync: false
+      - key: TWILIO_NUMBER
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PATIENT_PHONE
+        sync: false
+      - key: FAMILY_PHONE
+        sync: false

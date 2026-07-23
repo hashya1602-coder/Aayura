@@ -54,7 +54,12 @@ TWILIO_SID = os.getenv("TWILIO_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-PUBLIC_URL = (os.getenv("PUBLIC_URL", "") or os.getenv("NGROK_URL", "") or "").rstrip("/")
+# On Render, RENDER_EXTERNAL_URL is set automatically to this service's public URL,
+# so the wss:// WebSocket address resolves without any manual config. Locally it
+# falls back to the ngrok tunnel.
+PUBLIC_URL = (os.getenv("PUBLIC_URL", "")
+              or os.getenv("RENDER_EXTERNAL_URL", "")
+              or os.getenv("NGROK_URL", "") or "").rstrip("/")
 PATIENT_PHONE = os.getenv("PATIENT_PHONE", "")
 PATIENT_NAME = os.getenv("PATIENT_NAME", "Lakshmi")
 FAMILY_PHONE = os.getenv("FAMILY_PHONE", "")     # relative to alert if patient doesn't answer
