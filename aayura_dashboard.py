@@ -218,9 +218,12 @@ def ask_aasha(call_sid, patient_said):
     history.append({"role": "user", "content": patient_said})
     try:
         if claude:
+            # Haiku 4.5 = Anthropic's fastest model. On a phone call, low latency
+            # matters more than deep reasoning, and replies are only 1-2 sentences,
+            # so Haiku is the right brain. Short max_tokens = faster generation.
             reply = claude.messages.create(
-                model="claude-sonnet-5",
-                max_tokens=150,
+                model="claude-haiku-4-5",
+                max_tokens=120,
                 system=AASHA_PROMPT,
                 messages=history,
             ).content[0].text
