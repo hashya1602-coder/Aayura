@@ -1,25 +1,22 @@
 """
-AAYURA - Unified CareCall + Krisha dashboard
-============================================
-One screen that shows BOTH halves of the elderly-care system:
+AAYURA - vitals monitor + Aasha, the trilingual AI voice companion
+==================================================================
+  LEFT  - live vitals monitor (heart rate, glucose, SpO2, missed calls)
+          driven by a fake-sensor loop + a rules engine.
+  RIGHT - Aasha, the AI voice companion: call status, language picker,
+          a "Call now" button, and the live conversation transcript.
 
-  LEFT  - CareCall live vitals monitor (heart rate, glucose, SpO2,
-          missed calls) driven by a fake-sensor loop + a rules engine.
-  RIGHT - Krisha, the AI voice companion: call status, a "Call now"
-          button, and the live conversation transcript.
-
-The two are wired together: when the rules engine detects an EMERGENCY
-it automatically triggers a Krisha call and alerts the family - and you
-watch the whole thing happen on one page.
+Aasha phones the patient's real phone, LISTENS, thinks with Claude, and
+replies in the SAME language the patient speaks - English, Hindi (hi-IN)
+or Telugu (te-IN) - using Google text-to-speech voices. When the rules
+engine detects an EMERGENCY it auto-triggers a call and alerts family.
 
 Calls work two ways:
-  - REAL  : if Twilio + NGROK_URL are set in .env, it dials the patient's
-            real phone (same TwiML flow as krisha_phone.py).
-  - DEMO  : if no credentials, it runs a scripted simulated call so the
-            dashboard still shows a live conversation for judges.
+  REAL : if Twilio + PUBLIC_URL are set, it dials the patient for real.
+  DEMO : otherwise a scripted call plays so the dashboard still demos.
 
-Run it:   python3 aayura_dashboard.py
-Open:     http://localhost:5001
+Run locally:  python3 aayura_dashboard.py     ->  http://localhost:5001
+Deploy:       gunicorn aayura_dashboard:app   (Render reads render.yaml)
 """
 
 import os
@@ -48,18 +45,19 @@ load_dotenv()
 # ---------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------
+AGENT_NAME = "Aasha"
 TWILIO_SID = os.getenv("TWILIO_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-# Public base URL Twilio uses to reach our webhooks. In production this is the
-# deployed domain (PUBLIC_URL); locally it falls back to the ngrok tunnel.
+# Public base URL Twilio uses to reach our webhooks (the deployed domain in
+# production, or the ngrok tunnel locally).
 PUBLIC_URL = (os.getenv("PUBLIC_URL", "") or os.getenv("NGROK_URL", "") or "").rstrip("/")
 PATIENT_PHONE = os.getenv("PATIENT_PHONE", "+919160220119")
 PATIENT_NAME = os.getenv("PATIENT_NAME", "Lakshmi")
 FAMILY_PHONE = os.getenv("FAMILY_PHONE", "")
-
-VOICE = "Polly.Aditi"
+# Language Aasha starts a call in (also what Twilio transcribes first).
+DEFAULT_LANG = os.getenv("PRIMARY_LANG", "hi-IN")
 PORT = int(os.getenv("PORT", "5001"))   # hosts (Render/Railway) inject $PORT
 
 app = Flask(__name__)
@@ -69,6 +67,39 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if (anthropic and ANTHRO
 DEMO_MODE = os.getenv("DEMO_MODE", "").lower() in ("1", "true", "yes")
 CAN_CALL_FOR_REAL = (not DEMO_MODE) and bool(
     Client and TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER and PUBLIC_URL)
+
+# ---------------------------------------------------------------
+# LANGUAGES  (Google voices - the only provider with a Telugu voice)
+# ---------------------------------------------------------------
+VOICE_FOR = {
+    "en-IN": "Google.en-IN-Standard-A",
+    "hi-IN": "Google.hi-IN-Standard-A",
+    "te-IN": "Google.te-IN-Standard-A",
+}
+LANG_LABEL = {"en-IN": "English", "hi-IN": "Hindi", "te-IN": "Telugu"}
+
+GREETINGS = {
+    "en-IN": f"Hello {PATIENT_NAME}! This is Aasha. I called to check on you. How are you feeling today?",
+    "hi-IN": f"नमस्ते {PATIENT_NAME}! मैं आशा बोल रही हूँ। मैंने आपका हालचाल जानने के लिए फ़ोन किया है। आज आप कैसा महसूस कर रही हैं?",
+    "te-IN": f"నమస్తే {PATIENT_NAME}! నేను ఆశ మాట్లాడుతున్నాను. మీరు ఎలా ఉన్నారో తెలుసుకోవడానికి ఫోన్ చేశాను. ఈరోజు మీకు ఎలా అనిపిస్తోంది?",
+}
+REPROMPT = {
+    "en-IN": f"{PATIENT_NAME}, are you there?",
+    "hi-IN": "क्या आप सुन रही हैं?",
+    "te-IN": "మీరు వింటున్నారా?",
+}
+
+
+def detect_lang(text):
+    """Pick the language from the script the text is written in."""
+    for c in text:
+        if "ఀ" <= c <= "౿":
+            return "te-IN"          # Telugu block
+    for c in text:
+        if "ऀ" <= c <= "ॿ":
+            return "hi-IN"          # Devanagari block
+    return "en-IN"
+
 
 # ---------------------------------------------------------------
 # SHARED STATE
@@ -85,38 +116,47 @@ scenario = {"mode": "normal"}
 alerts = []
 last_alert_type = [None]
 
-# Krisha call state, shared with the dashboard
 call_state = {
     "status": "idle",         # idle / dialing / in_call / ended
     "mode": "-",              # REAL / DEMO
+    "lang": DEFAULT_LANG,      # current conversation language
     "reason": None,
     "family_alerted": False,
 }
-transcript = []               # chronological: {who, text, time}
+transcript = []               # chronological: {who, text, time, lang}
 conversations = {}            # per-CallSid history for the AI brain
 _call_lock = threading.Lock()
 
 
-def add_turn(who, text):
-    """who = 'patient' | 'krisha' | 'system'."""
-    transcript.append({"who": who, "text": text, "time": time.strftime("%H:%M:%S")})
+def add_turn(who, text, lang="en-IN"):
+    """who = 'patient' | 'aasha' | 'system'."""
+    transcript.append({"who": who, "text": text, "time": time.strftime("%H:%M:%S"), "lang": lang})
     del transcript[:-60]
 
 
 # ---------------------------------------------------------------
-# KRISHA'S BRAIN
+# AASHA'S BRAIN
 # ---------------------------------------------------------------
-KRISHA_PROMPT = f"""You are Krisha, a warm AI companion on a PHONE CALL with
-{PATIENT_NAME}, a 72-year-old woman in India. Keep every reply SHORT - one or
-two small sentences, warm and human like a favourite granddaughter. Ask one
-thing at a time. Gently check she has taken her medicines and eaten. If she
-mentions chest pain, dizziness, falling, breathlessness or sounds very unwell,
-stay calm, tell her family is being informed and she should sit down, and add
-the token <ALERT> at the very end (never say the word aloud). Only say goodbye
-when SHE wants to go, then add <END>. Never give medical advice or dosages."""
+AASHA_PROMPT = f"""You are Aasha, a warm, caring AI companion on a PHONE CALL
+with {PATIENT_NAME}, a 72-year-old person in India.
+
+LANGUAGE: The patient may speak Hindi, Telugu or English - sometimes mixing
+them. ALWAYS reply in the SAME language the patient just used. Reply in Telugu
+script for Telugu, Devanagari for Hindi, and plain English for English. Do not
+mix two scripts in one reply.
+
+STYLE: keep every reply SHORT - one or two small sentences, warm and human like
+a favourite granddaughter. Ask one gentle thing at a time - how they slept, if
+they ate, whether they took their medicines, how they feel.
+
+SAFETY: If they mention chest pain, dizziness, a fall, breathlessness, or sound
+very unwell, stay calm, tell them their family is being informed and they
+should sit down, and add the token <ALERT> at the very end (never say the word
+aloud). Only say goodbye when THEY want to go, then add <END>. Never give
+medical advice, dosages or a diagnosis. Never speak the tokens out loud."""
 
 
-def ask_krisha(call_sid, patient_said):
+def ask_aasha(call_sid, patient_said):
     history = conversations.setdefault(call_sid, [])
     history.append({"role": "user", "content": patient_said})
     try:
@@ -124,14 +164,14 @@ def ask_krisha(call_sid, patient_said):
             reply = claude.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=150,
-                system=KRISHA_PROMPT,
+                system=AASHA_PROMPT,
                 messages=history,
             ).content[0].text
         else:
-            reply = "I am here with you amma. Please sit and rest, I will stay on the line. <END>"
+            reply = "I am here with you. Please sit and rest, I will stay on the line. <END>"
     except Exception as e:
         print(f"[BRAIN ERROR] {e}")
-        reply = "I am sorry amma, I will call you again shortly. Take care. <END>"
+        reply = "I am sorry, I will call you again shortly. Take care. <END>"
     history.append({"role": "assistant", "content": reply})
     return reply
 
@@ -183,7 +223,7 @@ def raise_alert(alert_type, reason, call_patient, alert_family):
     entry = {"time": time.strftime("%H:%M:%S"), "reason": reason, "actions": []}
     if call_patient:
         trigger_voice_call(reason)
-        entry["actions"].append("AI voice call started")
+        entry["actions"].append("Aasha voice call started")
     if alert_family:
         send_family_alert(reason)
         entry["actions"].append("Family alerted")
@@ -195,9 +235,8 @@ def raise_alert(alert_type, reason, call_patient, alert_family):
 # ACTIONS - calling the patient (real Twilio or scripted demo)
 # ---------------------------------------------------------------
 def trigger_voice_call(reason):
-    """Fired by the rules engine or the dashboard button."""
     if call_state["status"] in ("dialing", "in_call"):
-        return  # a call is already happening
+        return
     if CAN_CALL_FOR_REAL:
         start_real_call(reason)
     else:
@@ -224,14 +263,15 @@ def start_real_call(reason):
         call_state["status"] = "ended"
 
 
+# scripted demo conversation - bilingual to show off the multilingual brain
 SIM_SCRIPT = [
-    ("krisha", "{name} amma, this is Krisha. Your monitor just showed something worrying - {reason}. Are you alright?"),
-    ("patient", "I feel a little dizzy and weak, beta."),
-    ("krisha", "Okay amma, please sit down slowly right now. I have already told your family - they are on the way."),
-    ("patient", "Okay... thank you."),
-    ("krisha", "Stay sitting and keep talking to me. If you have juice or something sweet nearby, take a small sip amma."),
-    ("patient", "I have some juice here."),
-    ("krisha", "Good, sip it slowly. I will stay right here with you until your family reaches you."),
+    ("aasha", "hi-IN", "{name} जी, मैं आशा बोल रही हूँ। आपकी तबीयत को लेकर एक चिंता दिखी - {reason}. आप ठीक हैं?"),
+    ("patient", "hi-IN", "थोड़ा चक्कर आ रहा है बेटा।"),
+    ("aasha", "hi-IN", "ठीक है {name} जी, आप धीरे से बैठ जाइए। मैंने आपके परिवार को बता दिया है, वे आ रहे हैं।"),
+    ("patient", "en-IN", "Okay... thank you."),
+    ("aasha", "en-IN", "Stay sitting and keep talking to me. If you have juice nearby, take a small sip."),
+    ("patient", "en-IN", "I have some juice here."),
+    ("aasha", "en-IN", "Good, sip it slowly. I will stay right here with you until your family reaches you."),
 ]
 
 
@@ -239,13 +279,14 @@ def run_simulated_call(reason):
     with _call_lock:
         call_state.update(status="dialing", mode="DEMO", reason=reason, family_alerted=False)
         transcript.clear()
-        add_turn("system", f"Krisha is calling {PATIENT_NAME} ... ({reason})")
+        add_turn("system", f"Aasha is calling {PATIENT_NAME} ... ({reason})")
         time.sleep(1.4)
         call_state["status"] = "in_call"
-        for who, line in SIM_SCRIPT:
-            add_turn(who, line.format(name=PATIENT_NAME, reason=reason))
+        for who, lang, line in SIM_SCRIPT:
+            call_state["lang"] = lang
+            add_turn(who, line.format(name=PATIENT_NAME, reason=reason), lang)
             time.sleep(1.9)
-        add_turn("system", "Call ended - Krisha stayed until family arrived.")
+        add_turn("system", "Call ended - Aasha stayed until family arrived.")
         call_state["status"] = "ended"
 
 
@@ -257,7 +298,7 @@ def send_family_alert(reason):
     try:
         Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
             to=FAMILY_PHONE, from_=TWILIO_NUMBER,
-            body=f"CareCall ALERT: {patient['name']} may need attention - {reason}. Please call her now.")
+            body=f"AAYURA ALERT: {patient['name']} may need attention - {reason}. Please call now.")
         print(f"[FAMILY ALERT] SMS sent to {FAMILY_PHONE}")
     except Exception as e:
         print(f"[FAMILY ALERT] SMS failed ({e})")
@@ -266,27 +307,25 @@ def send_family_alert(reason):
 # ---------------------------------------------------------------
 # TWILIO WEBHOOK ROUTES (used only for REAL calls)
 # ---------------------------------------------------------------
-def say_and_listen(text):
+def say_and_listen(text, lang):
+    voice = VOICE_FOR.get(lang, VOICE_FOR["en-IN"])
     vr = VoiceResponse()
     gather = Gather(input="speech", action="/respond", method="POST",
-                    language="en-IN", speech_timeout="auto")
-    gather.say(text, voice=VOICE)
+                    language=lang, speechTimeout="auto")
+    gather.say(text, voice=voice)
     vr.append(gather)
-    vr.say("Amma, are you there?", voice=VOICE)
+    vr.say(REPROMPT.get(lang, REPROMPT["en-IN"]), voice=voice)
     vr.redirect("/voice")
     return str(vr)
 
 
 @app.route("/voice", methods=["POST", "GET"])
 def voice():
-    import datetime
-    hour = datetime.datetime.now().hour
-    part = "morning" if hour < 12 else ("afternoon" if hour < 17 else "evening")
+    lang = call_state.get("lang", DEFAULT_LANG)
     call_state["status"] = "in_call"
-    greeting = (f"Good {part} {PATIENT_NAME} amma! This is Krisha. "
-                f"I called to check on you. How are you feeling today?")
-    add_turn("krisha", greeting)
-    return say_and_listen(greeting)
+    greeting = GREETINGS.get(lang, GREETINGS["en-IN"])
+    add_turn("aasha", greeting, lang)
+    return say_and_listen(greeting, lang)
 
 
 @app.route("/respond", methods=["POST"])
@@ -294,23 +333,28 @@ def respond():
     call_sid = request.form.get("CallSid", "unknown")
     patient_said = request.form.get("SpeechResult", "")
     if not patient_said:
-        return say_and_listen("Sorry amma, I could not hear you. Could you say that again?")
-    add_turn("patient", patient_said)
-    reply = ask_krisha(call_sid, patient_said)
+        lang = call_state.get("lang", DEFAULT_LANG)
+        return say_and_listen(REPROMPT.get(lang, REPROMPT["en-IN"]), lang)
+
+    p_lang = detect_lang(patient_said)
+    add_turn("patient", patient_said, p_lang)
+    reply = ask_aasha(call_sid, patient_said)
 
     if "<ALERT>" in reply:
         send_family_alert(f"reported feeling unwell during call ('{patient_said}')")
         reply = reply.replace("<ALERT>", "").strip()
     clean = reply.replace("<END>", "").strip()
-    add_turn("krisha", clean)
+    r_lang = detect_lang(clean)
+    call_state["lang"] = r_lang     # next Gather listens in Aasha's language
+    add_turn("aasha", clean, r_lang)
 
     if "<END>" in reply:
         vr = VoiceResponse()
-        vr.say(clean, voice=VOICE)
+        vr.say(clean, voice=VOICE_FOR.get(r_lang, VOICE_FOR["en-IN"]))
         vr.hangup()
         call_state["status"] = "ended"
         return str(vr)
-    return say_and_listen(clean)
+    return say_and_listen(clean, r_lang)
 
 
 @app.route("/call-status", methods=["POST"])
@@ -329,6 +373,9 @@ def data():
         "patient": patient,
         "alerts": alerts,
         "call": call_state,
+        "lang_label": LANG_LABEL.get(call_state["lang"], "English"),
+        "agent": AGENT_NAME,
+        "patient_name": PATIENT_NAME,
         "transcript": transcript,
         "can_call_real": CAN_CALL_FOR_REAL,
     })
@@ -336,18 +383,21 @@ def data():
 
 @app.route("/action/<what>", methods=["POST"])
 def action(what):
+    lang_map = {"lang_en": "en-IN", "lang_hi": "hi-IN", "lang_te": "te-IN"}
     if what == "reset":
         scenario["mode"] = "normal"
         patient.update(missed_calls=0, glucose=110, heart_rate=72)
         alerts.clear()
         last_alert_type[0] = None
-        call_state.update(status="idle", mode="-", reason=None, family_alerted=False)
+        call_state.update(status="idle", mode="-", lang=DEFAULT_LANG, reason=None, family_alerted=False)
         transcript.clear()
     elif what == "missed_call":
         patient["missed_calls"] += 1
         check_rules()
     elif what == "call_now":
         trigger_voice_call("manual check-in from dashboard")
+    elif what in lang_map:
+        call_state["lang"] = lang_map[what]
     else:
         scenario["mode"] = what
     return jsonify({"ok": True})
@@ -360,7 +410,7 @@ PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Aayura - CareCall + Krisha</title>
+<title>Aayura - Aasha voice companion</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',system-ui,sans-serif; }
@@ -395,6 +445,7 @@ PAGE = """
   button.reset:hover { border-color:#4ade80; color:#4ade80; }
   button.call { border-color:#e8a13c; color:#e8a13c; font-weight:600; }
   button.call:hover { background:#e8a13c; color:#0d1117; }
+  button.lang.active { border-color:#e8a13c; color:#e8a13c; background:#241a08; }
 
   .callhead { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
   .dot { width:12px; height:12px; border-radius:50%; background:#4b5563; }
@@ -402,15 +453,18 @@ PAGE = """
   .dot.in_call { background:#4ade80; animation:pulse 1.2s infinite; }
   .dot.ended { background:#8b949e; }
   .callstat { font-size:15px; font-weight:600; }
-  .badge { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid #30363d; color:#8b949e; margin-left:auto; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid #30363d; color:#8b949e; }
+  .badge.mode { margin-left:auto; }
   .fam { font-size:13px; color:#f87171; margin-bottom:12px; display:none; }
   .fam.on { display:block; }
+  .langrow { margin-bottom:12px; }
+  .langrow .lbl { font-size:12px; color:#8b949e; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px; }
 
   .chat { background:#0d1117; border:1px solid #30363d; border-radius:10px; padding:14px;
-          height:340px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
-  .bubble { max-width:82%; padding:9px 13px; border-radius:12px; font-size:14px; line-height:1.4; }
+          height:320px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+  .bubble { max-width:82%; padding:9px 13px; border-radius:12px; font-size:14px; line-height:1.5; }
   .bubble .who { font-size:11px; color:#8b949e; margin-bottom:3px; }
-  .krisha { align-self:flex-start; background:#1c2129; border:1px solid #30363d; border-radius:12px 12px 12px 2px; }
+  .aasha { align-self:flex-start; background:#1c2129; border:1px solid #30363d; border-radius:12px 12px 12px 2px; }
   .patient { align-self:flex-end; background:#16281c; border:1px solid #1f6f42; border-radius:12px 12px 2px 12px; }
   .system { align-self:center; background:transparent; color:#6b7280; font-size:12px; font-style:italic; }
   .chat .empty { color:#4b5563; font-size:14px; margin:auto; }
@@ -424,7 +478,7 @@ PAGE = """
 </head>
 <body>
 <div class="wrap">
-  <h1>Aa<span>yura</span> &nbsp;|&nbsp; CareCall + Krisha</h1>
+  <h1>Aa<span>yura</span></h1>
   <div class="sub">Patient: <b id="pname">-</b> &middot; vitals update every 2s &middot; <span id="callmode"></span></div>
 
   <div class="grid">
@@ -454,14 +508,23 @@ PAGE = """
       </div>
     </div>
 
-    <!-- RIGHT: Krisha -->
+    <!-- RIGHT: Aasha -->
     <div class="panel">
       <div class="callhead">
         <span class="dot" id="dot"></span>
-        <span class="callstat" id="callstat">Krisha idle</span>
-        <span class="badge" id="callbadge"></span>
+        <span class="callstat" id="callstat">Aasha idle</span>
+        <span class="badge">🗣 <span id="langlabel">Hindi</span></span>
+        <span class="badge mode" id="callbadge"></span>
       </div>
       <div class="fam" id="fam">Family has been alerted</div>
+
+      <div class="langrow">
+        <div class="lbl">Call language</div>
+        <button class="lang" data-l="lang_en" onclick="act('lang_en')">English</button>
+        <button class="lang" data-l="lang_hi" onclick="act('lang_hi')">Hindi</button>
+        <button class="lang" data-l="lang_te" onclick="act('lang_te')">Telugu</button>
+      </div>
+
       <button class="call" onclick="act('call_now')">Call patient now</button>
       <div class="chat" id="chat"><div class="empty">No call yet. Trigger an emergency or press "Call patient now".</div></div>
     </div>
@@ -469,13 +532,14 @@ PAGE = """
 </div>
 
 <script>
-const STAT = {idle:'Krisha idle', dialing:'Dialing patient...', in_call:'On call', ended:'Call ended'};
+const STAT = {idle:'Aasha idle', dialing:'Dialing patient...', in_call:'On call', ended:'Call ended'};
+const LANGKEY = {'en-IN':'lang_en','hi-IN':'lang_hi','te-IN':'lang_te'};
 async function act(what){ await fetch('/action/'+what, {method:'POST'}); refresh(); }
 
 async function refresh(){
   const d = await (await fetch('/data')).json();
   document.getElementById('pname').textContent = d.patient.name;
-  document.getElementById('callmode').textContent = d.can_call_real ? 'REAL calls armed (Twilio)' : 'DEMO mode (no Twilio keys)';
+  document.getElementById('callmode').textContent = d.can_call_real ? 'REAL calls armed (Twilio)' : 'DEMO mode (scripted)';
   document.getElementById('hr').textContent = d.patient.heart_rate;
   document.getElementById('gl').textContent = d.patient.glucose;
   document.getElementById('sp').textContent = d.patient.spo2;
@@ -486,11 +550,14 @@ async function refresh(){
   document.getElementById('c-hr').className = 'card' + (d.patient.heart_rate>120?' danger':d.patient.heart_rate>100?' warn':'');
   document.getElementById('c-gl').className = 'card' + (d.patient.glucose<70?' danger':d.patient.glucose<85?' warn':'');
 
-  // Krisha panel
+  // Aasha panel
   document.getElementById('dot').className = 'dot ' + d.call.status;
-  document.getElementById('callstat').textContent = STAT[d.call.status] || 'Krisha';
+  document.getElementById('callstat').textContent = STAT[d.call.status] || 'Aasha';
   document.getElementById('callbadge').textContent = d.call.mode !== '-' ? d.call.mode : '';
+  document.getElementById('langlabel').textContent = d.lang_label;
   document.getElementById('fam').className = 'fam' + (d.call.family_alerted ? ' on' : '');
+  document.querySelectorAll('.lang').forEach(b =>
+    b.classList.toggle('active', b.dataset.l === LANGKEY[d.call.lang]));
 
   const chat = document.getElementById('chat');
   if(!d.transcript.length){
@@ -499,7 +566,7 @@ async function refresh(){
     const near = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
     chat.innerHTML = d.transcript.map(t => t.who==='system'
       ? `<div class="bubble system">${t.text}</div>`
-      : `<div class="bubble ${t.who}"><div class="who">${t.who==='krisha'?'Krisha':'Lakshmi'} &middot; ${t.time}</div>${t.text}</div>`
+      : `<div class="bubble ${t.who}"><div class="who">${t.who==='aasha'?d.agent:d.patient_name} &middot; ${t.time}</div>${t.text}</div>`
     ).join('');
     if(near) chat.scrollTop = chat.scrollHeight;
   }
@@ -539,7 +606,7 @@ start_background()
 
 if __name__ == "__main__":
     print("=" * 56)
-    print("AAYURA unified dashboard  ->  http://localhost:%d" % PORT)
+    print("AAYURA (Aasha) dashboard  ->  http://localhost:%d" % PORT)
     print("Calls:", "REAL (Twilio armed)" if CAN_CALL_FOR_REAL else "DEMO mode (scripted, no Twilio keys)")
     print("Brain:", "Claude" if claude else "scripted fallback")
     print("=" * 56)

@@ -15,6 +15,9 @@ services:
         value: "1"
       - key: PATIENT_NAME
         value: Radha
+      # Language Aasha starts each call in: hi-IN / en-IN / te-IN
+      - key: PRIMARY_LANG
+        value: hi-IN
       # --- secrets: set these in the Render dashboard, not here ---
       - key: TWILIO_SID
         sync: false
