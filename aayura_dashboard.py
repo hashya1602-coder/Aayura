@@ -52,13 +52,15 @@ TWILIO_SID = os.getenv("TWILIO_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-NGROK_URL = (os.getenv("NGROK_URL", "") or "").rstrip("/")
+# Public base URL Twilio uses to reach our webhooks. In production this is the
+# deployed domain (PUBLIC_URL); locally it falls back to the ngrok tunnel.
+PUBLIC_URL = (os.getenv("PUBLIC_URL", "") or os.getenv("NGROK_URL", "") or "").rstrip("/")
 PATIENT_PHONE = os.getenv("PATIENT_PHONE", "+919160220119")
 PATIENT_NAME = os.getenv("PATIENT_NAME", "Lakshmi")
 FAMILY_PHONE = os.getenv("FAMILY_PHONE", "")
 
 VOICE = "Polly.Aditi"
-PORT = 5001
+PORT = int(os.getenv("PORT", "5001"))   # hosts (Render/Railway) inject $PORT
 
 app = Flask(__name__)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if (anthropic and ANTHROPIC_API_KEY) else None
@@ -66,7 +68,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if (anthropic and ANTHRO
 # use this while rehearsing so you never dial the patient's real phone.
 DEMO_MODE = os.getenv("DEMO_MODE", "").lower() in ("1", "true", "yes")
 CAN_CALL_FOR_REAL = (not DEMO_MODE) and bool(
-    Client and TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER and NGROK_URL)
+    Client and TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER and PUBLIC_URL)
 
 # ---------------------------------------------------------------
 # SHARED STATE
@@ -210,8 +212,8 @@ def start_real_call(reason):
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
             to=PATIENT_PHONE, from_=TWILIO_NUMBER,
-            url=f"{NGROK_URL}/voice",
-            status_callback=f"{NGROK_URL}/call-status",
+            url=f"{PUBLIC_URL}/voice",
+            status_callback=f"{PUBLIC_URL}/call-status",
             status_callback_event=["completed"],
             timeout=25,
         )
@@ -519,11 +521,26 @@ def home():
     return render_template_string(PAGE)
 
 
-if __name__ == "__main__":
+# Start the vitals simulator once, on import - so it runs under a production
+# server (gunicorn) as well as local `python3`. Guarded against double-start.
+_bg_started = False
+
+
+def start_background():
+    global _bg_started
+    if _bg_started:
+        return
+    _bg_started = True
     threading.Thread(target=simulate_vitals, daemon=True).start()
+
+
+start_background()
+
+
+if __name__ == "__main__":
     print("=" * 56)
     print("AAYURA unified dashboard  ->  http://localhost:%d" % PORT)
     print("Calls:", "REAL (Twilio armed)" if CAN_CALL_FOR_REAL else "DEMO mode (scripted, no Twilio keys)")
     print("Brain:", "Claude" if claude else "scripted fallback")
     print("=" * 56)
-    app.run(debug=False, port=PORT)
+    app.run(debug=False, host="0.0.0.0", port=PORT)

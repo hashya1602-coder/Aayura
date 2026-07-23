@@ -1,0 +1,33 @@
+# Render Blueprint - deploys the Aayura dashboard.
+# In Render: New + -> Blueprint -> pick this repo. It reads this file.
+# Secrets (sync: false) are entered in the Render dashboard, never committed.
+services:
+  - type: web
+    name: aayura
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn aayura_dashboard:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      # Safe default: scripted calls only, so the public demo never dials a
+      # real phone. Set to "0" (and fill the Twilio vars) to arm real calls.
+      - key: DEMO_MODE
+        value: "1"
+      - key: PATIENT_NAME
+        value: Radha
+      # --- secrets: set these in the Render dashboard, not here ---
+      - key: TWILIO_SID
+        sync: false
+      - key: TWILIO_TOKEN
+        sync: false
+      - key: TWILIO_NUMBER
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PATIENT_PHONE
+        sync: false
+      - key: FAMILY_PHONE
+        sync: false
+      # Your live domain once known, e.g. https://aayura.com - Twilio calls back here
+      - key: PUBLIC_URL
+        sync: false
