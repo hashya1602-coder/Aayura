@@ -20,11 +20,14 @@ Deploy:       gunicorn aayura_dashboard:app   (Render reads render.yaml)
 """
 
 import os
+import base64
 import random
 import threading
 import time
+import uuid
 
-from flask import Flask, jsonify, request, render_template_string
+import requests
+from flask import Flask, jsonify, request, render_template_string, Response
 from dotenv import load_dotenv
 
 # Optional deps - the demo still runs without Twilio / Anthropic installed
@@ -59,6 +62,11 @@ FAMILY_PHONE = os.getenv("FAMILY_PHONE", "")
 # Language Aasha starts a call in (also what Twilio transcribes first).
 DEFAULT_LANG = os.getenv("PRIMARY_LANG", "hi-IN")
 PORT = int(os.getenv("PORT", "5001"))   # hosts (Render/Railway) inject $PORT
+
+# Sarvam AI - external TTS used for Telugu, which Twilio's <Say> cannot speak.
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+SARVAM_MODEL = os.getenv("SARVAM_MODEL", "bulbul:v2")
+SARVAM_SPEAKER = os.getenv("SARVAM_SPEAKER", "anushka")   # female voice for Aasha
 
 app = Flask(__name__)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if (anthropic and ANTHROPIC_API_KEY) else None
@@ -99,6 +107,55 @@ def detect_lang(text):
         if "ऀ" <= c <= "ॿ":
             return "hi-IN"          # Devanagari block
     return "en-IN"
+
+
+# Twilio has no Telugu voice, so we synthesize Telugu with Sarvam AI and play
+# the audio to the caller via <Play>. Generated clips are cached in memory and
+# served from /audio/<id>.wav (Twilio fetches them over PUBLIC_URL).
+audio_store = {}   # id -> wav bytes
+
+
+def synth_sarvam(text, lang):
+    """Return an audio id for a Sarvam-generated clip, or None on failure."""
+    if not SARVAM_API_KEY:
+        return None
+    try:
+        r = requests.post(
+            "https://api.sarvam.ai/text-to-speech",
+            headers={"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"},
+            json={
+                "inputs": [text[:500]],
+                "target_language_code": lang,
+                "speaker": SARVAM_SPEAKER,
+                "model": SARVAM_MODEL,
+                "speech_sample_rate": 8000,     # Twilio phone audio
+                "enable_preprocessing": True,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        wav = base64.b64decode(r.json()["audios"][0])
+        aid = uuid.uuid4().hex
+        audio_store[aid] = wav
+        for k in list(audio_store)[:-50]:       # keep only the last 50 clips
+            audio_store.pop(k, None)
+        return aid
+    except Exception as e:
+        print(f"[SARVAM ERROR] {e}")
+        return None
+
+
+def voice_say(container, text, lang):
+    """Speak `text` on a VoiceResponse/Gather. Telugu -> Sarvam <Play>,
+    everything else -> Twilio <Say>."""
+    if lang == "te-IN" and SARVAM_API_KEY and PUBLIC_URL:
+        aid = synth_sarvam(text, lang)
+        if aid:
+            container.play(f"{PUBLIC_URL}/audio/{aid}.wav")
+            return
+        print("[SARVAM] Telugu synth failed - falling back to Hindi voice")
+        lang = "hi-IN"     # audible fallback (mispronounced) rather than silence
+    container.say(text, voice=VOICE_FOR.get(lang, VOICE_FOR["en-IN"]))
 
 
 # ---------------------------------------------------------------
@@ -308,15 +365,22 @@ def send_family_alert(reason):
 # TWILIO WEBHOOK ROUTES (used only for REAL calls)
 # ---------------------------------------------------------------
 def say_and_listen(text, lang):
-    voice = VOICE_FOR.get(lang, VOICE_FOR["en-IN"])
     vr = VoiceResponse()
     gather = Gather(input="speech", action="/respond", method="POST",
                     language=lang, speechTimeout="auto")
-    gather.say(text, voice=voice)
+    voice_say(gather, text, lang)
     vr.append(gather)
-    vr.say(REPROMPT.get(lang, REPROMPT["en-IN"]), voice=voice)
+    voice_say(vr, REPROMPT.get(lang, REPROMPT["en-IN"]), lang)
     vr.redirect("/voice")
     return str(vr)
+
+
+@app.route("/audio/<aid>.wav")
+def audio(aid):
+    wav = audio_store.get(aid)
+    if not wav:
+        return ("not found", 404)
+    return Response(wav, mimetype="audio/wav")
 
 
 @app.route("/voice", methods=["POST", "GET"])
@@ -350,7 +414,7 @@ def respond():
 
     if "<END>" in reply:
         vr = VoiceResponse()
-        vr.say(clean, voice=VOICE_FOR.get(r_lang, VOICE_FOR["en-IN"]))
+        voice_say(vr, clean, r_lang)
         vr.hangup()
         call_state["status"] = "ended"
         return str(vr)

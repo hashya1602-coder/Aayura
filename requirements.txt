@@ -3,3 +3,4 @@ gunicorn
 twilio
 anthropic
 python-dotenv
+requests
