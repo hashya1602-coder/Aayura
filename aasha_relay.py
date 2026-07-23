@@ -29,10 +29,15 @@ Your .env (in ~/Desktop) supplies TWILIO_*, ANTHROPIC_API_KEY, NGROK_URL,
 PATIENT_PHONE, PATIENT_NAME.
 """
 
+import functools
 import json
 import os
 import threading
 from xml.sax.saxutils import escape
+
+# Flush every print immediately so the live call transcript shows up in logs
+# (and in Render's log stream) as it happens, instead of being buffered.
+print = functools.partial(print, flush=True)
 
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
