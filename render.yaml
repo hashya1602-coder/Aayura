@@ -31,6 +31,9 @@ services:
         sync: false
       - key: FAMILY_PHONE
         sync: false
+      # Sarvam AI key - enables real Telugu voice (Twilio has no Telugu <Say>).
+      - key: SARVAM_API_KEY
+        sync: false
       # Your live domain once known, e.g. https://aayura.com - Twilio calls back here
       - key: PUBLIC_URL
         sync: false
