@@ -21,6 +21,7 @@ Deploy:       gunicorn aayura_dashboard:app   (Render reads render.yaml)
 
 import os
 import base64
+import collections
 import random
 import threading
 import time
@@ -85,6 +86,15 @@ VOICE_FOR = {
     "te-IN": "Google.te-IN-Standard-A",
 }
 LANG_LABEL = {"en-IN": "English", "hi-IN": "Hindi", "te-IN": "Telugu"}
+
+# Clinically-informed "normal" reference ranges shown under each vital card.
+RANGES = {
+    "heart_rate": {"low": 60, "high": 100, "unit": "bpm", "label": "Heart rate"},
+    "glucose":    {"low": 70, "high": 140, "unit": "mg/dL", "label": "Blood glucose"},
+    "spo2":       {"low": 95, "high": 100, "unit": "%", "label": "Blood oxygen"},
+}
+# Daily check-in schedule (display only, for the schedule panel).
+SCHEDULE = [os.getenv("MORNING_CALL", "08:00"), os.getenv("EVENING_CALL", "19:00")]
 
 GREETINGS = {
     "en-IN": f"Hello {PATIENT_NAME}! This is Aasha. I called to check on you. How are you feeling today?",
@@ -173,12 +183,22 @@ scenario = {"mode": "normal"}
 alerts = []
 last_alert_type = [None]
 
+# rolling per-vital history for the drill-down charts (~5 min at 2s cadence)
+VITAL_HISTORY = {
+    "heart_rate": collections.deque(maxlen=150),
+    "glucose": collections.deque(maxlen=150),
+    "spo2": collections.deque(maxlen=150),
+}
+# outcome record per completed call: time, language, mode, level, flags, summary
+call_log = []
+
 call_state = {
     "status": "idle",         # idle / dialing / in_call / ended
     "mode": "-",              # REAL / DEMO
     "lang": DEFAULT_LANG,      # current conversation language
     "reason": None,
     "family_alerted": False,
+    "finalized": False,        # guard so each call is logged once
 }
 transcript = []               # chronological: {who, text, time, lang}
 conversations = {}            # per-CallSid history for the AI brain
@@ -189,6 +209,62 @@ def add_turn(who, text, lang="en-IN"):
     """who = 'patient' | 'aasha' | 'system'."""
     transcript.append({"who": who, "text": text, "time": time.strftime("%H:%M:%S"), "lang": lang})
     del transcript[:-60]
+
+
+# ---------------------------------------------------------------
+# CALL OUTCOMES - read how the patient spoke to flag health issues
+# ---------------------------------------------------------------
+# Symptom lexicon across English + Hindi + Telugu. "urgent" symptoms push the
+# whole call to a "concern" outcome; the rest to "watch".
+SYMPTOMS = {
+    "dizziness":       {"urgent": True,  "words": ["dizzy", "giddy", "faint", "चक्कर", "కళ్లు తిరుగు", "తల తిరుగు"]},
+    "chest pain":      {"urgent": True,  "words": ["chest pain", "सीने में दर्द", "छाती", "ఛాతీ నొప్పి"]},
+    "breathlessness":  {"urgent": True,  "words": ["breathless", "short of breath", "साँस", "ఊపిరి", "శ్వాస"]},
+    "a fall":          {"urgent": True,  "words": ["i fell", "fell down", "गिर गय", "గిరిపో", "పడిపో", "పడ్డా"]},
+    "weakness":        {"urgent": False, "words": ["weak", "so tired", "no energy", "कमज़ोर", "थकान", "నీరసం", "బలహీన"]},
+    "pain":            {"urgent": False, "words": ["pain", "aches", "it hurts", "दर्द", "నొప్పి"]},
+    "not eaten":       {"urgent": False, "words": ["not eaten", "didn't eat", "haven't eaten", "नहीं खाया", "తినలేదు"]},
+    "missed medicine": {"urgent": False, "words": ["not taken", "didn't take", "forgot my", "दवा नहीं", "మందు తీసుకోలేదు"]},
+}
+
+
+def analyze_transcript(patient_lines):
+    """Return {level, flags, summary} from what the patient said on the call."""
+    if not patient_lines:
+        return {"level": "no-answer", "flags": [], "summary": "Patient did not speak."}
+    text = " ".join(patient_lines).lower()
+    flags, urgent = [], False
+    for flag, spec in SYMPTOMS.items():
+        if any(w.lower() in text for w in spec["words"]):
+            flags.append(flag)
+            urgent = urgent or spec["urgent"]
+    level = "concern" if urgent else ("watch" if flags else "ok")
+    summary = ("Mentioned " + ", ".join(flags) + "." if flags
+               else "No health concerns mentioned; sounded fine.")
+    return {"level": level, "flags": flags, "summary": summary}
+
+
+def finalize_call(mode):
+    """Log the just-finished call with a health assessment (once per call)."""
+    if call_state.get("finalized"):
+        return
+    call_state["finalized"] = True
+    patient_lines = [t["text"] for t in transcript if t["who"] == "patient"]
+    a = analyze_transcript(patient_lines)
+    call_log.insert(0, {
+        "time": time.strftime("%H:%M"),
+        "date": time.strftime("%b %d"),
+        "mode": mode,
+        "lang": LANG_LABEL.get(call_state.get("lang"), "English"),
+        "reason": call_state.get("reason") or "check-in",
+        "turns": len(patient_lines),
+        "level": a["level"],
+        "flags": a["flags"],
+        "summary": a["summary"],
+    })
+    del call_log[20:]
+    if a["level"] == "concern":
+        print(f"[OUTCOME] health concern: {a['summary']}")
 
 
 # ---------------------------------------------------------------
@@ -251,6 +327,9 @@ def simulate_vitals():
             patient["heart_rate"] = random.randint(85, 95)
         elif mode == "hr_spike":
             patient["heart_rate"] = min(155, patient["heart_rate"] + 10)
+        _t = time.strftime("%H:%M:%S")
+        for _k in VITAL_HISTORY:
+            VITAL_HISTORY[_k].append({"t": _t, "v": patient[_k]})
         check_rules()
         time.sleep(2)
 
@@ -304,7 +383,7 @@ def trigger_voice_call(reason):
 
 
 def start_real_call(reason):
-    call_state.update(status="dialing", mode="REAL", reason=reason, family_alerted=False)
+    call_state.update(status="dialing", mode="REAL", reason=reason, family_alerted=False, finalized=False)
     transcript.clear()
     add_turn("system", f"Dialing {PATIENT_PHONE} ... ({reason})")
     try:
@@ -337,7 +416,7 @@ SIM_SCRIPT = [
 
 def run_simulated_call(reason):
     with _call_lock:
-        call_state.update(status="dialing", mode="DEMO", reason=reason, family_alerted=False)
+        call_state.update(status="dialing", mode="DEMO", reason=reason, family_alerted=False, finalized=False)
         transcript.clear()
         add_turn("system", f"Aasha is calling {PATIENT_NAME} ... ({reason})")
         time.sleep(1.4)
@@ -348,6 +427,7 @@ def run_simulated_call(reason):
             time.sleep(1.9)
         add_turn("system", "Call ended - Aasha stayed until family arrived.")
         call_state["status"] = "ended"
+        finalize_call("DEMO")
 
 
 def send_family_alert(reason):
@@ -420,6 +500,7 @@ def respond():
         voice_say(vr, clean, r_lang)
         vr.hangup()
         call_state["status"] = "ended"
+        finalize_call("REAL")
         return str(vr)
     return say_and_listen(clean, r_lang)
 
@@ -428,6 +509,7 @@ def respond():
 def call_status():
     if request.form.get("CallStatus", "") == "completed":
         call_state["status"] = "ended"
+        finalize_call("REAL")
     return ("", 204)
 
 
@@ -445,6 +527,10 @@ def data():
         "patient_name": PATIENT_NAME,
         "transcript": transcript,
         "can_call_real": CAN_CALL_FOR_REAL,
+        "ranges": RANGES,
+        "history": {k: list(v) for k, v in VITAL_HISTORY.items()},
+        "call_log": call_log,
+        "schedule": SCHEDULE,
     })
 
 
@@ -456,7 +542,8 @@ def action(what):
         patient.update(missed_calls=0, glucose=110, heart_rate=72)
         alerts.clear()
         last_alert_type[0] = None
-        call_state.update(status="idle", mode="-", lang=DEFAULT_LANG, reason=None, family_alerted=False)
+        call_state.update(status="idle", mode="-", lang=DEFAULT_LANG, reason=None,
+                          family_alerted=False, finalized=False)
         transcript.clear()
     elif what == "missed_call":
         patient["missed_calls"] += 1
@@ -541,6 +628,39 @@ PAGE = """
   .alerts .t { color:#8b949e; font-size:12px; }
   .alerts .a { color:#e8a13c; font-size:13px; margin-top:4px; }
   .empty { color:#4b5563; font-size:14px; }
+
+  .card.clickable { cursor:pointer; }
+  .card.clickable:hover { border-color:#e8a13c; }
+  .card .range { font-size:11px; color:#6b7280; margin-top:6px; }
+  .card .range.out { color:#f87171; }
+
+  /* drill-down modal */
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
+           align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal.show { display:flex; }
+  .modal .box { background:#161b22; border:1px solid #30363d; border-radius:14px; padding:22px; max-width:560px; width:100%; }
+  .modal .box h2 { font-size:18px; }
+  .modal .now { font-size:30px; font-weight:600; margin-top:4px; }
+  .modal .meta { color:#8b949e; font-size:13px; margin:2px 0 4px; }
+  .modal .stats { display:flex; gap:22px; margin-top:12px; font-size:12px; color:#8b949e; }
+  .modal .stats b { color:#e6edf3; font-size:16px; display:block; }
+  .modal .close { float:right; cursor:pointer; color:#8b949e; font-size:22px; line-height:1; }
+  .spark { width:100%; height:130px; background:#0d1117; border:1px solid #30363d; border-radius:10px; margin-top:8px; display:block; }
+
+  /* schedule + outcomes */
+  .sched { font-size:13px; color:#8b949e; margin-bottom:14px; }
+  .sched b { color:#e6edf3; }
+  .call-item { background:#0d1117; border:1px solid #30363d; border-radius:10px; padding:12px 14px; margin-bottom:10px; }
+  .call-item .top { display:flex; align-items:center; gap:8px; font-size:12px; color:#8b949e; margin-bottom:6px; flex-wrap:wrap; }
+  .call-item .sum { font-size:14px; }
+  .lvl { font-size:11px; font-weight:600; padding:2px 8px; border-radius:10px; }
+  .lvl.ok { background:#0f2e1d; color:#4ade80; border:1px solid #1f6f42; }
+  .lvl.watch { background:#332600; color:#fbbf24; border:1px solid #8a6d1a; }
+  .lvl.concern { background:#3a0d0d; color:#f87171; border:1px solid #a03030; }
+  .lvl.no-answer { background:#21262d; color:#8b949e; border:1px solid #30363d; }
+  .chips { margin-top:6px; }
+  .chip { display:inline-block; font-size:11px; background:#241a08; color:#e8a13c;
+          border:1px solid #5a4416; border-radius:10px; padding:2px 8px; margin:3px 4px 0 0; }
 </style>
 </head>
 <body>
@@ -554,11 +674,12 @@ PAGE = """
       <div class="panel">
         <div id="status" class="status NORMAL">NORMAL</div>
         <div class="cards">
-          <div class="card" id="c-hr"><div class="label">Heart rate</div><div><span class="value" id="hr">-</span><span class="unit">bpm</span></div></div>
-          <div class="card" id="c-gl"><div class="label">Blood glucose</div><div><span class="value" id="gl">-</span><span class="unit">mg/dL</span></div></div>
-          <div class="card"><div class="label">Blood oxygen</div><div><span class="value" id="sp">-</span><span class="unit">%</span></div></div>
-          <div class="card"><div class="label">Missed calls</div><div><span class="value" id="mc">-</span><span class="unit">/5</span></div></div>
+          <div class="card clickable" id="c-hr" onclick="openDrill('heart_rate')"><div class="label">Heart rate</div><div><span class="value" id="hr">-</span><span class="unit">bpm</span></div><div class="range" id="r-hr"></div></div>
+          <div class="card clickable" id="c-gl" onclick="openDrill('glucose')"><div class="label">Blood glucose</div><div><span class="value" id="gl">-</span><span class="unit">mg/dL</span></div><div class="range" id="r-gl"></div></div>
+          <div class="card clickable" id="c-sp" onclick="openDrill('spo2')"><div class="label">Blood oxygen</div><div><span class="value" id="sp">-</span><span class="unit">%</span></div><div class="range" id="r-sp"></div></div>
+          <div class="card"><div class="label">Missed calls</div><div><span class="value" id="mc">-</span><span class="unit">/5</span></div><div class="range">Alert at 5</div></div>
         </div>
+        <div style="font-size:12px;color:#6b7280;margin-top:10px">Tap a vital to see its history &rarr;</div>
       </div>
 
       <div class="panel">
@@ -575,8 +696,9 @@ PAGE = """
       </div>
     </div>
 
-    <!-- RIGHT: Aasha -->
-    <div class="panel">
+    <!-- RIGHT: Aasha + outcomes -->
+    <div>
+      <div class="panel">
       <div class="callhead">
         <span class="dot" id="dot"></span>
         <span class="callstat" id="callstat">Aasha idle</span>
@@ -594,6 +716,30 @@ PAGE = """
 
       <button class="call" onclick="act('call_now')">Call patient now</button>
       <div class="chat" id="chat"><div class="empty">No call yet. Trigger an emergency or press "Call patient now".</div></div>
+      </div>
+
+      <div class="panel">
+        <h3>Call schedule &amp; outcomes</h3>
+        <div class="sched" id="sched"></div>
+        <div id="calllog"><div class="empty">No calls yet.</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- drill-down modal -->
+<div class="modal" id="modal" onclick="if(event.target===this)closeDrill()">
+  <div class="box">
+    <span class="close" onclick="closeDrill()">&times;</span>
+    <h2 id="m-title">Vital</h2>
+    <div class="now"><span id="m-now">-</span> <span style="font-size:14px;color:#8b949e" id="m-unit"></span></div>
+    <div class="meta" id="m-range"></div>
+    <svg class="spark" id="m-spark" viewBox="0 0 500 130" preserveAspectRatio="none"></svg>
+    <div class="stats">
+      <div><b id="m-min">-</b>min</div>
+      <div><b id="m-max">-</b>max</div>
+      <div><b id="m-avg">-</b>avg</div>
+      <div><b id="m-n">-</b>readings</div>
     </div>
   </div>
 </div>
@@ -601,21 +747,90 @@ PAGE = """
 <script>
 const STAT = {idle:'Aasha idle', dialing:'Dialing patient...', in_call:'On call', ended:'Call ended'};
 const LANGKEY = {'en-IN':'lang_en','hi-IN':'lang_hi','te-IN':'lang_te'};
+const VMAP = {heart_rate:'r-hr', glucose:'r-gl', spo2:'r-sp'};
+const VNAME = {heart_rate:'Heart rate', glucose:'Blood glucose', spo2:'Blood oxygen'};
+let LAST = null, DRILL = null;
+
 async function act(what){ await fetch('/action/'+what, {method:'POST'}); refresh(); }
+const inRange = (v, r) => v >= r.low && v <= r.high;
+
+function renderRanges(d){
+  for(const key in VMAP){
+    const r = d.ranges[key]; if(!r) continue;
+    const el = document.getElementById(VMAP[key]);
+    el.textContent = `Normal ${r.low}–${r.high} ${r.unit}`;
+    el.className = 'range' + (inRange(d.patient[key], r) ? '' : ' out');
+  }
+}
+
+function renderSchedule(d){
+  document.getElementById('sched').innerHTML =
+    'Daily check-ins: <b>' + (d.schedule||[]).join('</b> &middot; <b>') + '</b>';
+}
+
+function renderCallLog(d){
+  const box = document.getElementById('calllog');
+  if(!d.call_log || !d.call_log.length){ box.innerHTML='<div class="empty">No calls yet. Trigger one to see its outcome here.</div>'; return; }
+  box.innerHTML = d.call_log.map(c => `
+    <div class="call-item">
+      <div class="top">
+        <span>${c.date} ${c.time}</span><span>&middot; ${c.lang}</span><span>&middot; ${c.mode}</span>
+        <span class="lvl ${c.level}" style="margin-left:auto">${c.level.toUpperCase().replace('-',' ')}</span>
+      </div>
+      <div class="sum">${c.summary}</div>
+      ${c.flags && c.flags.length ? '<div class="chips">'+c.flags.map(f=>`<span class="chip">${f}</span>`).join('')+'</div>' : ''}
+    </div>`).join('');
+}
+
+function openDrill(key){
+  if(!LAST) return;
+  DRILL = key;
+  document.getElementById('m-title').textContent = VNAME[key];
+  const r = LAST.ranges[key];
+  document.getElementById('m-unit').textContent = r.unit;
+  document.getElementById('m-range').textContent = `Normal range ${r.low}–${r.high} ${r.unit}`;
+  document.getElementById('modal').classList.add('show');
+  drawDrill(key);
+}
+function closeDrill(){ DRILL = null; document.getElementById('modal').classList.remove('show'); }
+
+function drawDrill(key){
+  const hist = (LAST.history[key]||[]).map(p=>p.v);
+  const r = LAST.ranges[key];
+  document.getElementById('m-now').textContent = LAST.patient[key];
+  if(!hist.length){ document.getElementById('m-spark').innerHTML=''; return; }
+  const mn=Math.min(...hist), mx=Math.max(...hist);
+  document.getElementById('m-min').textContent = mn;
+  document.getElementById('m-max').textContent = mx;
+  document.getElementById('m-avg').textContent = Math.round(hist.reduce((a,b)=>a+b,0)/hist.length);
+  document.getElementById('m-n').textContent = hist.length;
+  const W=500,H=130,pad=10;
+  const lo=Math.min(mn,r.low), hi=Math.max(mx,r.high), span=(hi-lo)||1;
+  const x=i=>pad+i*(W-2*pad)/Math.max(1,hist.length-1);
+  const y=v=>H-pad-(v-lo)*(H-2*pad)/span;
+  const pts=hist.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const bt=y(r.high), bb=y(r.low);
+  document.getElementById('m-spark').innerHTML =
+    `<rect x="0" y="${bt.toFixed(1)}" width="${W}" height="${Math.max(0,bb-bt).toFixed(1)}" fill="#1f6f42" opacity="0.16"/>`+
+    `<polyline points="${pts}" fill="none" stroke="#e8a13c" stroke-width="2" stroke-linejoin="round"/>`;
+}
 
 async function refresh(){
   const d = await (await fetch('/data')).json();
+  LAST = d;
   document.getElementById('pname').textContent = d.patient.name;
   document.getElementById('callmode').textContent = d.can_call_real ? 'REAL calls armed (Twilio)' : 'DEMO mode (scripted)';
   document.getElementById('hr').textContent = d.patient.heart_rate;
   document.getElementById('gl').textContent = d.patient.glucose;
   document.getElementById('sp').textContent = d.patient.spo2;
   document.getElementById('mc').textContent = d.patient.missed_calls;
+  renderRanges(d);
 
   const st = document.getElementById('status');
   st.textContent = d.patient.status; st.className = 'status ' + d.patient.status;
-  document.getElementById('c-hr').className = 'card' + (d.patient.heart_rate>120?' danger':d.patient.heart_rate>100?' warn':'');
-  document.getElementById('c-gl').className = 'card' + (d.patient.glucose<70?' danger':d.patient.glucose<85?' warn':'');
+  document.getElementById('c-hr').className = 'card clickable' + (d.patient.heart_rate>120?' danger':d.patient.heart_rate>100?' warn':'');
+  document.getElementById('c-gl').className = 'card clickable' + (d.patient.glucose<70?' danger':d.patient.glucose<85?' warn':'');
+  document.getElementById('c-sp').className = 'card clickable' + (d.patient.spo2<95?' warn':'');
 
   // Aasha panel
   document.getElementById('dot').className = 'dot ' + d.call.status;
@@ -642,6 +857,10 @@ async function refresh(){
   box.innerHTML = d.alerts.length ? d.alerts.map(a =>
     `<div class="alert-item"><div class="t">${a.time}</div><div>${a.reason}</div><div class="a">-> ${a.actions.join(' &middot; ')}</div></div>`
   ).join('') : '<div class="empty">No alerts yet - all healthy</div>';
+
+  renderSchedule(d);
+  renderCallLog(d);
+  if(DRILL) drawDrill(DRILL);   // keep an open chart live
 }
 setInterval(refresh, 1000); refresh();
 </script>
