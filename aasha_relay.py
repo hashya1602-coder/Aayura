@@ -84,26 +84,38 @@ conversations = {}
 # No <END>/<ALERT> tokens here - in a streaming voice call we let the caller
 # hang up naturally, and tokens would get spoken aloud before we could strip them.
 AASHA_PROMPT = f"""You are Aasha, a warm, caring AI companion on a live PHONE
-CALL with {PATIENT_NAME}, a 72-year-old person in India.
+CALL with {PATIENT_NAME}, a young man in India. {PATIENT_NAME} is male - address
+him warmly by his name, use he/him, and never call him amma, dadi or treat him
+as a woman.
 
-Reply in the SAME language the patient speaks - English or Hindi (Devanagari).
+ALWAYS reply in simple, clear ENGLISH, even if the patient speaks another
+language. Do not switch to Hindi.
 Keep every reply SHORT: one or two small sentences, warm and human like a
-favourite granddaughter. Ask one gentle thing at a time - how they slept,
+caring friend. Ask one gentle thing at a time - how he slept,
 whether they ate, if they took their medicines, how they feel. If they sound
 unwell, stay calm and tell them you are letting their family know. Never give
 medical advice or dosages. Do not use any special tokens or symbols."""
 
 # Prompt for when Aasha reaches the RELATIVE instead of the patient
 AASHA_FAMILY_PROMPT = f"""You are Aasha, a warm AI care companion, on a live
-PHONE CALL with a FAMILY MEMBER of {PATIENT_NAME}, a 72-year-old person in India.
-You are calling because {PATIENT_NAME} did not answer her scheduled check-in call.
+PHONE CALL with a FAMILY MEMBER of {PATIENT_NAME}, a young man in India.
+You are calling because {PATIENT_NAME} did not answer his scheduled check-in call.
 
 Reply in the SAME language the family member speaks - English or Hindi.
 Keep every reply SHORT: one or two small sentences, calm and reassuring.
-Explain that {PATIENT_NAME} missed her check-in and gently ask them to call or
-visit her to make sure she is okay. Answer their questions simply - if they ask
-what happened, say she did not pick up the phone and you wanted someone to check
-on her. Never give medical advice. Do not use any special tokens or symbols."""
+Explain that {PATIENT_NAME} missed his check-in and gently ask them to call or
+visit him to make sure he is okay. Answer their questions simply - if they ask
+what happened, say he did not pick up the phone and you wanted someone to check
+on him. Never give medical advice. Do not use any special tokens or symbols."""
+
+# Used when the family is called BECAUSE the patient reported an emergency mid-call
+AASHA_FAMILY_EMERGENCY_PROMPT = f"""You are Aasha, a calm AI care companion on a
+live PHONE CALL with a FAMILY MEMBER of {PATIENT_NAME}, a young man in India.
+This is URGENT: during his check-in call, {PATIENT_NAME} reported something that
+may be an emergency (such as a fall or pain). Reply in English, SHORT and calm.
+Tell them clearly that {PATIENT_NAME} may need help right now, and ask them to go
+to him or call him immediately and get medical help if needed. Answer questions
+simply. Do not give a diagnosis. Do not use any special tokens or symbols."""
 
 
 def build_relay_twiml(greeting, params=None):
@@ -137,6 +149,36 @@ def tts_lang_for(text):
 # tracks calls we've already escalated, so the relative is called at most once
 _escalated = set()
 
+# ---------------------------------------------------------------
+# EMERGENCY: text family the moment it's detected, call them when the call ends
+# ---------------------------------------------------------------
+URGENT_WORDS = ["i fell", "fell down", "fell over", "had a fall", "can't move", "cannot move",
+                "can't get up", "cannot get up", "broke my", "broken", "chest pain",
+                "can't breathe", "cannot breathe", "breathless", "dizzy", "fainted", "faint",
+                "bleeding", "unconscious", "collapsed", "heart attack", "stroke", "severe pain"]
+call_flags = {}                                    # call_sid -> {emergency, sms_sent, family_called, reason}
+emergency_ctx = {"active": False, "reason": ""}    # drives the family greeting / prompt
+
+
+def is_emergency(text):
+    t = (text or "").lower()
+    return any(w in t for w in URGENT_WORDS)
+
+
+def sms_family(reason):
+    """Fire-and-forget SMS to the relative the instant an emergency is detected."""
+    if not (Client and FAMILY_PHONE and TWILIO_SID):
+        print("[SMS] skipped (need FAMILY_PHONE + Twilio)")
+        return
+    try:
+        Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            to=FAMILY_PHONE, from_=TWILIO_NUMBER,
+            body=f"AAYURA ALERT: {PATIENT_NAME} may need urgent help - {reason}. "
+                 f"Please call or check on him right now.")
+        print(f"[SMS] emergency SMS sent to {FAMILY_PHONE}")
+    except Exception as e:
+        print(f"[SMS ERROR] {e}")
+
 
 def call_family(call_sid, reason):
     """Ring the relative when the patient can't be reached."""
@@ -160,8 +202,13 @@ def call_family(call_sid, reason):
 @app.route("/family_voice", methods=["POST", "GET"])
 def family_voice():
     """The relative gets an interactive ConversationRelay call, not a recording."""
-    greeting = (f"Hello, this is Aasha from Aayura. I am calling because {PATIENT_NAME} "
-                f"did not answer her check-in call. Is someone in the family there?")
+    if emergency_ctx.get("active"):
+        greeting = (f"Hello, this is Aasha from Aayura. This is urgent. During his check-in "
+                    f"call, {PATIENT_NAME} {emergency_ctx.get('reason', 'reported a problem')}. "
+                    f"Please check on him right away. Is someone in the family there?")
+    else:
+        greeting = (f"Hello, this is Aasha from Aayura. I am calling because {PATIENT_NAME} "
+                    f"did not answer his check-in call. Is someone in the family there?")
     return Response(build_relay_twiml(greeting, {"role": "family"}), mimetype="text/xml")
 
 
@@ -204,7 +251,19 @@ def stream_reply(ws, call_sid, user_text, stop, role="patient"):
     history.append({"role": "user", "content": user_text})
     who = "family" if role == "family" else PATIENT_NAME
     print(f"[HEARD] {who}: {user_text}")
-    system = AASHA_FAMILY_PROMPT if role == "family" else AASHA_PROMPT
+    if role == "family":
+        system = AASHA_FAMILY_EMERGENCY_PROMPT if emergency_ctx.get("active") else AASHA_FAMILY_PROMPT
+    else:
+        system = AASHA_PROMPT
+        # emergency in what the patient just said -> text family immediately (once)
+        if is_emergency(user_text):
+            f = call_flags.setdefault(call_sid, {})
+            f["emergency"] = True
+            f["reason"] = f"said: {user_text}"
+            if not f.get("sms_sent"):
+                f["sms_sent"] = True
+                print("[EMERGENCY] detected -> texting family")
+                threading.Thread(target=sms_family, args=(f["reason"],), daemon=True).start()
     full = ""
     try:
         if not claude:
@@ -277,6 +336,17 @@ def relay_ws(ws):
         elif mtype == "error":
             print(f"[RELAY ERROR] {msg.get('description')}")
 
+    # call ended: if the patient reported an emergency, call the family now
+    f = call_flags.get(call_sid or "", {})
+    if role == "patient" and f.get("emergency") and not f.get("family_called"):
+        f["family_called"] = True
+        emergency_ctx["active"] = True
+        emergency_ctx["reason"] = f.get("reason", "reported a possible emergency")
+        print("[EMERGENCY] patient call ended -> calling family")
+        call_family(call_sid, "emergency during call")
+    if role == "family":
+        emergency_ctx["active"] = False        # reset once family has been reached
+    call_flags.pop(call_sid or "", None)
     print("[RELAY] call ended")
 
 
