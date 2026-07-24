@@ -649,8 +649,11 @@ PAGE = """
   .spark { width:100%; height:130px; background:#0d1117; border:1px solid #30363d; border-radius:10px; margin-top:8px; display:block; }
 
   /* schedule + outcomes */
-  .sched { font-size:13px; color:#8b949e; margin-bottom:14px; }
-  .sched b { color:#e6edf3; }
+  .sched { margin-bottom:14px; }
+  .schedchip { display:inline-block; font-size:13px; background:#0d1117; border:1px solid #30363d;
+               border-radius:8px; padding:5px 12px; margin:0 8px 8px 0; color:#e6edf3; }
+  .nextcall { font-size:13px; color:#8b949e; margin-top:2px; }
+  .nextcall b { color:#e8a13c; }
   .call-item { background:#0d1117; border:1px solid #30363d; border-radius:10px; padding:12px 14px; margin-bottom:10px; }
   .call-item .top { display:flex; align-items:center; gap:8px; font-size:12px; color:#8b949e; margin-bottom:6px; flex-wrap:wrap; }
   .call-item .sum { font-size:14px; }
@@ -667,7 +670,7 @@ PAGE = """
 <body>
 <div class="wrap">
   <h1>Aa<span>yura</span></h1>
-  <div class="sub">Patient: <b id="pname">-</b> &middot; vitals update every 2s &middot; <span id="callmode"></span></div>
+  <div class="sub">Patient: <b id="pname">-</b> &middot; Next check-in: <b id="nextcall" style="color:#e8a13c">-</b> &middot; <span id="callmode"></span></div>
 
   <div class="grid">
     <!-- LEFT: vitals + rules -->
@@ -762,9 +765,20 @@ function renderRanges(d){
   }
 }
 
+function nextCall(sched){
+  if(!sched || !sched.length) return '-';
+  const now = new Date(), cur = now.getHours()*60 + now.getMinutes();
+  const mins = sched.map(t => { const [h,m]=t.split(':').map(Number); return h*60+m; });
+  for(let i=0;i<mins.length;i++){ if(mins[i] > cur) return 'today ' + sched[i]; }
+  return 'tomorrow ' + sched[0];
+}
 function renderSchedule(d){
+  const s = d.schedule || [];
   document.getElementById('sched').innerHTML =
-    'Daily check-ins: <b>' + (d.schedule||[]).join('</b> &middot; <b>') + '</b>';
+    s.map(t => `<span class="schedchip">&#128337; ${t}</span>`).join('') +
+    `<div class="nextcall">Next check-in: <b>${nextCall(s)}</b></div>`;
+  const nc = document.getElementById('nextcall');
+  if(nc) nc.textContent = nextCall(s);
 }
 
 function renderCallLog(d){
@@ -781,8 +795,8 @@ function renderCallLog(d){
     </div>`).join('');
 }
 
-function openDrill(key){
-  if(!LAST) return;
+async function openDrill(key){
+  if(!LAST){ try { LAST = await (await fetch('/data')).json(); } catch(e){ return; } }
   DRILL = key;
   document.getElementById('m-title').textContent = VNAME[key];
   const r = LAST.ranges[key];
