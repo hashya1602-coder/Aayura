@@ -1054,6 +1054,7 @@ SITE_PAGE = r"""<!DOCTYPE html>
         </div>
         <div style="display:flex; align-items:center; gap:10px;">
           <span id="d-mode" style="display:inline-flex; align-items:center; gap:7px; background:var(--chip); border:1px solid var(--border2); color:var(--muted2); padding:8px 14px; border-radius:999px; font-size:12.5px; font-weight:600; font-family:ui-monospace,monospace;">—</span>
+          <div onclick="openConsole()" class="btn" style="padding:8px 16px; border-radius:999px; border:1px solid var(--border2); background:var(--card); color:var(--muted2); font-size:12.5px; font-weight:700; font-family:ui-monospace,monospace; cursor:pointer;" onmouseover="this.style.borderColor='#E07A2E';this.style.color='#E07A2E'" onmouseout="this.style.borderColor='var(--border2)';this.style.color='var(--muted2)'">◐ Simulate</div>
         </div>
       </div>
 
@@ -1101,35 +1102,6 @@ SITE_PAGE = r"""<!DOCTYPE html>
 
         <!-- RIGHT -->
         <div style="display:flex; flex-direction:column; gap:18px;">
-          <!-- Aayura call controls -->
-          <div style="background:#0F6E63; color:#EAF3F0; border-radius:22px; padding:24px;">
-            <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
-              <span id="calldot" style="width:11px; height:11px; border-radius:50%; background:#9FCDC4;"></span>
-              <span id="callstat" style="font-weight:700; font-size:15px;">Aayura idle</span>
-              <span id="callmode2" style="margin-left:auto; font-size:11px; font-family:ui-monospace,monospace; background:rgba(255,255,255,0.14); padding:3px 9px; border-radius:999px;"></span>
-            </div>
-            <div style="font-size:12px; color:#9FCDC4; text-transform:uppercase; letter-spacing:0.1em; font-weight:700; margin-bottom:8px;">Call language</div>
-            <div style="display:flex; gap:8px; margin-bottom:16px;">
-              <div onclick="act('lang_en')" class="langchip" data-l="en-IN">English</div>
-              <div onclick="act('lang_hi')" class="langchip" data-l="hi-IN">Hindi</div>
-              <div onclick="act('lang_te')" class="langchip" data-l="te-IN">Telugu</div>
-            </div>
-            <div onclick="callRadha(this)" class="btn" style="padding:14px; background:#E07A2E; color:#FFF; border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; text-align:center; box-shadow:0 6px 16px rgba(224,122,46,0.3);">☎ Call now</div>
-            <div id="famAlerted" style="display:none; margin-top:10px; font-size:13px; color:#FBD9D4;">⚠ Family has been alerted.</div>
-          </div>
-
-          <!-- Demo simulation -->
-          <div style="background:var(--card); border:1px solid var(--border); border-radius:22px; padding:24px;">
-            <h2 class="serif" style="font-weight:600; font-size:20px; margin:0 0 4px;">Demo simulation</h2>
-            <div style="font-size:13px; color:var(--faint); margin-bottom:14px;">Drive the fake-sensor feed to trigger the rules engine.</div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <div onclick="act('glucose_drop')" class="dbtn">Glucose drop</div>
-              <div onclick="act('hr_spike')" class="dbtn">Heart-rate spike</div>
-              <div onclick="act('missed_call')" class="dbtn">Miss a call</div>
-              <div onclick="act('reset')" class="dbtn" style="border-color:#BFDCD5;color:#0B534B;">Reset</div>
-            </div>
-          </div>
-
           <!-- Call history / outcomes -->
           <div style="background:var(--card); border:1px solid var(--border); border-radius:22px; padding:24px;">
             <h2 class="serif" style="font-weight:600; font-size:20px; margin:0 0 4px;">Call history &amp; outcomes</h2>
@@ -1161,6 +1133,39 @@ SITE_PAGE = r"""<!DOCTYPE html>
         <div><b id="m-max" style="color:var(--ink); font-size:16px; display:block;">—</b>max</div>
         <div><b id="m-avg" style="color:var(--ink); font-size:16px; display:block;">—</b>avg</div>
         <div><b id="m-n" style="color:var(--ink); font-size:16px; display:block;">—</b>readings</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SIMULATE CONSOLE (call controls + demo sensor events) -->
+  <div class="modal" id="console" onclick="if(event.target===this)closeConsole()">
+    <div style="background:var(--card); border:1px solid var(--border); border-radius:20px; padding:24px; max-width:430px; width:100%;">
+      <div style="display:flex; align-items:center; margin-bottom:16px;">
+        <h2 class="serif" style="font-size:20px; margin:0; flex:1;">Simulation console</h2>
+        <span onclick="closeConsole()" style="cursor:pointer; color:var(--faint); font-size:22px; line-height:1;">&times;</span>
+      </div>
+      <div style="background:#0F6E63; color:#EAF3F0; border-radius:16px; padding:18px; margin-bottom:18px;">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
+          <span id="calldot" style="width:11px; height:11px; border-radius:50%; background:#9FCDC4;"></span>
+          <span id="callstat" style="font-weight:700; font-size:15px;">Aayura idle</span>
+          <span id="callmode2" style="margin-left:auto; font-size:11px; font-family:ui-monospace,monospace; background:rgba(255,255,255,0.14); padding:3px 9px; border-radius:999px;"></span>
+        </div>
+        <div style="font-size:12px; color:#9FCDC4; text-transform:uppercase; letter-spacing:0.1em; font-weight:700; margin-bottom:8px;">Call language</div>
+        <div style="display:flex; gap:8px; margin-bottom:16px;">
+          <div onclick="act('lang_en')" class="langchip" data-l="en-IN">English</div>
+          <div onclick="act('lang_hi')" class="langchip" data-l="hi-IN">Hindi</div>
+          <div onclick="act('lang_te')" class="langchip" data-l="te-IN">Telugu</div>
+        </div>
+        <div onclick="callRadha(this)" class="btn" style="padding:14px; background:#E07A2E; color:#FFF; border-radius:12px; font-weight:700; font-size:15px; cursor:pointer; text-align:center; box-shadow:0 6px 16px rgba(224,122,46,0.3);">☎ Call now</div>
+        <div id="famAlerted" style="display:none; margin-top:10px; font-size:13px; color:#FBD9D4;">⚠ Family has been alerted.</div>
+      </div>
+      <div style="font-size:12.5px; font-weight:700; color:var(--muted); margin-bottom:8px;">Simulate sensor events</div>
+      <div style="font-size:12.5px; color:var(--faint); margin-bottom:12px;">Drive the fake-sensor feed to trigger the rules engine (watch the dashboard react).</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <div onclick="act('glucose_drop')" class="dbtn">Glucose drop</div>
+        <div onclick="act('hr_spike')" class="dbtn">Heart-rate spike</div>
+        <div onclick="act('missed_call')" class="dbtn">Miss a call</div>
+        <div onclick="act('reset')" class="dbtn" style="border-color:#BFDCD5;color:#0B534B;">Reset</div>
       </div>
     </div>
   </div>
@@ -1360,6 +1365,8 @@ async function openDrill(key){
   el('modal').classList.add('show'); drawDrill(key);
 }
 function closeDrill(){ DRILL=null; el('modal').classList.remove('show'); }
+function openConsole(){ el('console').classList.add('show'); refresh(); }
+function closeConsole(){ el('console').classList.remove('show'); }
 function drawDrill(key){
   const hist=(LAST.history[key]||[]).map(p=>p.v), r=LAST.ranges[key];
   el('m-now').textContent=LAST.patient[key];
