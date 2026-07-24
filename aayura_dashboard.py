@@ -22,6 +22,7 @@ Deploy:       gunicorn aayura_dashboard:app   (Render reads render.yaml)
 import os
 import base64
 import collections
+import datetime
 import random
 import threading
 import time
@@ -683,11 +684,9 @@ PAGE = """
       </div>
 
       <div class="panel">
-        <h3>Demo controls</h3>
-        <button onclick="act('glucose_drop')">Simulate glucose drop</button>
-        <button onclick="act('hr_spike')">Simulate heart-rate spike</button>
-        <button onclick="act('missed_call')">Patient misses a call</button>
-        <button class="reset" onclick="act('reset')">Reset to normal</button>
+        <h3>Demo simulation</h3>
+        <div style="font-size:14px;color:#8b949e;margin-bottom:12px">Trigger emergencies and reset the patient on the dedicated simulation page.</div>
+        <button class="call" onclick="location.href='/demo'">Open demo controls &rarr;</button>
       </div>
 
       <div class="panel alerts">
@@ -874,6 +873,119 @@ def home():
     return render_template_string(PAGE)
 
 
+# ---------------------------------------------------------------
+# DEMO SIMULATION PAGE (separate from the main dashboard)
+# ---------------------------------------------------------------
+DEMO_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Aayura - Demo simulation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',system-ui,sans-serif; }
+  body { background:#0d1117; color:#e6edf3; min-height:100vh; padding:28px 20px; }
+  .wrap { max-width:760px; margin:0 auto; }
+  a.back { color:#e8a13c; text-decoration:none; font-size:14px; }
+  h1 { font-size:24px; font-weight:600; margin-top:10px; } h1 span { color:#e8a13c; }
+  .sub { color:#8b949e; margin:4px 0 22px; font-size:14px; }
+  .panel { background:#161b22; border:1px solid #30363d; border-radius:14px; padding:20px; margin-bottom:20px; }
+  .panel h3 { font-size:13px; color:#8b949e; margin-bottom:14px; text-transform:uppercase; letter-spacing:1px; }
+  .status { display:inline-block; padding:6px 18px; border-radius:20px; font-weight:600; font-size:14px; margin-bottom:16px; }
+  .NORMAL { background:#0f2e1d; color:#4ade80; border:1px solid #1f6f42; }
+  .WARNING { background:#332600; color:#fbbf24; border:1px solid #8a6d1a; }
+  .EMERGENCY { background:#3a0d0d; color:#f87171; border:1px solid #a03030; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; }
+  .card { background:#0d1117; border:1px solid #30363d; border-radius:12px; padding:16px; }
+  .card .label { color:#8b949e; font-size:12px; margin-bottom:6px; }
+  .card .value { font-size:28px; font-weight:600; }
+  .card .unit { font-size:12px; color:#8b949e; margin-left:3px; }
+  button { background:#21262d; color:#e6edf3; border:1px solid #30363d; padding:12px 18px;
+           border-radius:8px; cursor:pointer; font-size:14px; margin:0 8px 10px 0; transition:all .15s; }
+  button:hover { border-color:#e8a13c; color:#e8a13c; }
+  button.reset:hover { border-color:#4ade80; color:#4ade80; }
+  .hint { color:#6b7280; font-size:13px; margin-top:8px; }
+  .hint a { color:#e8a13c; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; Back to dashboard</a>
+  <h1>Aa<span>yura</span> &middot; Demo simulation</h1>
+  <div class="sub">Drive the fake-sensor feed to demo the rules engine and Aasha's auto-call.</div>
+
+  <div class="panel">
+    <h3>Live patient state</h3>
+    <div id="status" class="status NORMAL">NORMAL</div>
+    <div class="cards">
+      <div class="card"><div class="label">Heart rate</div><div><span class="value" id="hr">-</span><span class="unit">bpm</span></div></div>
+      <div class="card"><div class="label">Blood glucose</div><div><span class="value" id="gl">-</span><span class="unit">mg/dL</span></div></div>
+      <div class="card"><div class="label">Blood oxygen</div><div><span class="value" id="sp">-</span><span class="unit">%</span></div></div>
+      <div class="card"><div class="label">Missed calls</div><div><span class="value" id="mc">-</span><span class="unit">/5</span></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Demo controls</h3>
+    <button onclick="act('glucose_drop')">Simulate glucose drop</button>
+    <button onclick="act('hr_spike')">Simulate heart-rate spike</button>
+    <button onclick="act('missed_call')">Patient misses a call</button>
+    <button class="reset" onclick="act('reset')">Reset to normal</button>
+    <div class="hint">Glucose &lt; 70 or heart rate &gt; 120 raises an EMERGENCY, which auto-calls Aasha and alerts family. Watch it unfold on the <a href="/">dashboard</a>.</div>
+  </div>
+</div>
+<script>
+  async function act(w){ await fetch('/action/'+w,{method:'POST'}); refresh(); }
+  async function refresh(){
+    const d = await (await fetch('/data')).json();
+    document.getElementById('hr').textContent = d.patient.heart_rate;
+    document.getElementById('gl').textContent = d.patient.glucose;
+    document.getElementById('sp').textContent = d.patient.spo2;
+    document.getElementById('mc').textContent = d.patient.missed_calls;
+    const st = document.getElementById('status');
+    st.textContent = d.patient.status; st.className = 'status ' + d.patient.status;
+  }
+  setInterval(refresh, 1000); refresh();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/demo")
+def demo():
+    return render_template_string(DEMO_PAGE)
+
+
+# ---------------------------------------------------------------
+# SAMPLE DATA - preload Radha so the dashboard looks alive on first load
+# ---------------------------------------------------------------
+def seed_sample_data():
+    if VITAL_HISTORY["heart_rate"]:
+        return
+    now = time.time()
+    n = 90
+    for i in range(n):
+        t = time.strftime("%H:%M:%S", time.localtime(now - (n - i) * 120))
+        VITAL_HISTORY["heart_rate"].append({"t": t, "v": random.randint(68, 84)})
+        VITAL_HISTORY["glucose"].append({"t": t, "v": random.randint(96, 128)})
+        VITAL_HISTORY["spo2"].append({"t": t, "v": random.randint(96, 99)})
+    patient.update(heart_rate=80, glucose=115, spo2=96, missed_calls=0, status="NORMAL")
+
+    def _d(off):
+        return (datetime.date.today() - datetime.timedelta(days=off)).strftime("%b %d")
+    call_log[:] = [
+        {"time": "08:04", "date": _d(0), "mode": "REAL", "lang": "Hindi", "reason": "morning check-in",
+         "turns": 6, "level": "ok", "flags": [], "summary": "Slept well, took morning tablets, ate breakfast. Sounded cheerful."},
+        {"time": "19:06", "date": _d(1), "mode": "REAL", "lang": "Telugu", "reason": "evening check-in",
+         "turns": 5, "level": "watch", "flags": ["not eaten"], "summary": "Skipped dinner - said she had no appetite. Otherwise fine."},
+        {"time": "08:11", "date": _d(1), "mode": "REAL", "lang": "Hindi", "reason": "morning check-in",
+         "turns": 7, "level": "concern", "flags": ["dizziness", "weakness"], "summary": "Felt dizzy and weak on waking; family was alerted."},
+        {"time": "19:02", "date": _d(2), "mode": "REAL", "lang": "English", "reason": "evening check-in",
+         "turns": 6, "level": "ok", "flags": [], "summary": "Took evening medicines, watched TV, in good spirits."},
+    ]
+
+
 # Start the vitals simulator once, on import - so it runs under a production
 # server (gunicorn) as well as local `python3`. Guarded against double-start.
 _bg_started = False
@@ -884,6 +996,7 @@ def start_background():
     if _bg_started:
         return
     _bg_started = True
+    seed_sample_data()
     threading.Thread(target=simulate_vitals, daemon=True).start()
 
 
